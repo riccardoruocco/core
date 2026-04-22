@@ -21,6 +21,8 @@ import com.dotcms.publisher.environment.business.EnvironmentAPI;
 import com.dotcms.publisher.pusher.PushUtils;
 import com.dotcms.publishing.*;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.dotcms.vanityurl.business.VanityUrlAPI;
+import com.dotcms.vanityurl.model.CachedVanityUrl;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.filefilter.TrueFileFilter;
 import com.dotmarketing.beans.Host;
@@ -36,6 +38,7 @@ import org.jetbrains.annotations.NotNull;
 import java.io.File;
 import java.util.*;
 import java.util.stream.Collectors;
+import javax.servlet.http.HttpServletResponse;
 
 /**
  * Similar to the TimeMachine this will be use several bundlers to create a static copy of the site.
@@ -57,6 +60,7 @@ public class AWSS3Publisher extends Publisher {
     public static final String DOTCMS_PUSH_AWS_S3_SECRET                 = "aws_secret_access_key";
     public static final String PROTOCOL_AWS_S3                           = "awss3";
     public static final String DEFAULT_BUCKET_NAME                       = "dot-bucket-default";
+    public static final String STATIC_PUSH_S3_VANITY_ALIAS_ENABLED       = "STATIC_PUSH_S3_VANITY_ALIAS_ENABLED";
 
     private static final String CREATED_BUCKETS                          = "createdBuckets";
 
@@ -65,6 +69,8 @@ public class AWSS3Publisher extends Publisher {
     private final EnvironmentAPI environmentAPI;
     private final PublishingEndPointAPI publisherEndPointAPI;
     private final PushedAssetsAPI pushedAssetsAPI;
+    private final VanityUrlAPI vanityUrlAPI;
+    private final S3VanityAliasMapRepository s3VanityAliasMapRepository;
 
     /**
      * Class constructor.
@@ -75,6 +81,8 @@ public class AWSS3Publisher extends Publisher {
         this.environmentAPI = APILocator.getEnvironmentAPI();
         this.publisherEndPointAPI = APILocator.getPublisherEndPointAPI();
         this.pushedAssetsAPI = APILocator.getPushedAssetsAPI();
+        this.vanityUrlAPI = APILocator.getVanityUrlAPI();
+        this.s3VanityAliasMapRepository = new S3VanityAliasMapRepository();
     }
 
     /**
@@ -91,11 +99,36 @@ public class AWSS3Publisher extends Publisher {
             final EnvironmentAPI environmentAPI,
             final PublishingEndPointAPI publisherEndPointAPI,
             final PushedAssetsAPI pushedAssetsAPI) {
+        this(hostAPI, publishAuditAPI, environmentAPI, publisherEndPointAPI, pushedAssetsAPI,
+                APILocator.getVanityUrlAPI(), new S3VanityAliasMapRepository());
+    }
+
+    /**
+     * Extended constructor for tests and explicit dependency composition.
+     *
+     * @param hostAPI host API.
+     * @param publishAuditAPI publish audit API.
+     * @param environmentAPI environment API.
+     * @param publisherEndPointAPI publishing endpoint API.
+     * @param pushedAssetsAPI pushed assets API.
+     * @param vanityUrlAPI Vanity URL API.
+     * @param s3VanityAliasMapRepository S3 vanity mapping repository.
+     */
+    @VisibleForTesting
+    public AWSS3Publisher(final HostAPI hostAPI,
+            final PublishAuditAPI publishAuditAPI,
+            final EnvironmentAPI environmentAPI,
+            final PublishingEndPointAPI publisherEndPointAPI,
+            final PushedAssetsAPI pushedAssetsAPI,
+            final VanityUrlAPI vanityUrlAPI,
+            final S3VanityAliasMapRepository s3VanityAliasMapRepository) {
         this.hostAPI = hostAPI;
         this.publishAuditAPI = publishAuditAPI;
         this.environmentAPI = environmentAPI;
         this.publisherEndPointAPI = publisherEndPointAPI;
         this.pushedAssetsAPI = pushedAssetsAPI;
+        this.vanityUrlAPI = vanityUrlAPI;
+        this.s3VanityAliasMapRepository = s3VanityAliasMapRepository;
     }
 
     /**
@@ -321,6 +354,8 @@ public class AWSS3Publisher extends Publisher {
 
                                     final String bucketName = getBucketName(this.config);
                                     final String bucketPrefix = getBucketPrefix(bucketPrefixProp, this.config);
+                                    final StaticTarget staticTarget =
+                                            new StaticTarget(endpoint.getId(), endPointPublisher, bucketName, bucketPrefix);
 
                                     /* Creates a bucket only if it does not exist.
                                        In order to avoid aws stale reads, we verify against out set of buckets names
@@ -346,8 +381,10 @@ public class AWSS3Publisher extends Publisher {
                                         try {
                                             if (amIPublishing) {
                                                 endPointPublisher.pushBundleToEndpoint(bucketName, bucketRegion, bucketPrefix, filePath, file);
+                                                publishVanityAliases(new VanityRequest(staticTarget, host, language, bundleRoot, file));
                                             } else {
                                                 endPointPublisher.deleteFilesFromEndpoint(bucketName, bucketPrefix, filePath);
+                                                unpublishVanityAliases(new VanityRequest(staticTarget, host, language, bundleRoot, file));
                                             }
                                         } catch(DotPublishingException e) {
                                             String error = updateStatusFailedToSend(currentStatusHistory, environment, endpoint, detail);
@@ -419,6 +456,412 @@ public class AWSS3Publisher extends Publisher {
 
         return config;
     } // process.
+
+    /**
+     * Holds the static endpoint data needed to manage vanity URLs during
+     * publishing and unpublishing.
+     *
+     * @param endpointId endpoint identifier.
+     * @param publisher facade to S3.
+     * @param bucketName target bucket.
+     * @param bucketPrefix configured bucket prefix.
+     */
+    private static final class StaticTarget {
+
+        private final String endpointId;
+        private final AWSS3EndPointPublisher publisher;
+        private final String bucketName;
+        private final String bucketPrefix;
+
+        /**
+         * Creates a new container for the endpoint static data.
+         *
+         * @param endpointId endpoint identifier.
+         * @param publisher facade to S3.
+         * @param bucketName target bucket.
+         * @param bucketPrefix configured bucket prefix.
+         */
+        private StaticTarget(
+                final String endpointId,
+                final AWSS3EndPointPublisher publisher,
+                final String bucketName,
+                final String bucketPrefix) {
+            this.endpointId = endpointId;
+            this.publisher = publisher;
+            this.bucketName = bucketName;
+            this.bucketPrefix = bucketPrefix;
+        }
+
+        /**
+         * Returns the endpoint identifier.
+         *
+         * @return endpoint identifier.
+         */
+        private String endpointId() {
+            return endpointId;
+        }
+
+        /**
+         * Returns the S3 facade.
+         *
+         * @return S3 endpoint publisher.
+         */
+        private AWSS3EndPointPublisher publisher() {
+            return publisher;
+        }
+
+        /**
+         * Returns the target bucket.
+         *
+         * @return bucket name.
+         */
+        private String bucketName() {
+            return bucketName;
+        }
+
+        /**
+         * Returns the configured bucket prefix.
+         *
+         * @return bucket prefix.
+         */
+        private String bucketPrefix() {
+            return bucketPrefix;
+        }
+    }
+
+    /**
+     * Collects the context required to process vanity URLs for a specific
+     * static file.
+     *
+     * @param target active S3 destination.
+     * @param host host of the static file.
+     * @param language language of the static file.
+     * @param bundleRoot static bundle root.
+     * @param file file or directory being processed.
+     */
+    private static final class VanityRequest {
+
+        private final StaticTarget target;
+        private final Host host;
+        private final Language language;
+        private final File bundleRoot;
+        private final File file;
+
+        /**
+         * Creates a new working context for vanity URLs.
+         *
+         * @param target active S3 destination.
+         * @param host host of the static file.
+         * @param language language of the static file.
+         * @param bundleRoot static bundle root.
+         * @param file file or directory being processed.
+         */
+        private VanityRequest(
+                final StaticTarget target,
+                final Host host,
+                final Language language,
+                final File bundleRoot,
+                final File file) {
+            this.target = target;
+            this.host = host;
+            this.language = language;
+            this.bundleRoot = bundleRoot;
+            this.file = file;
+        }
+
+        /**
+         * Returns the active S3 destination.
+         *
+         * @return current endpoint context.
+         */
+        private StaticTarget target() {
+            return target;
+        }
+
+        /**
+         * Returns the host of the static file.
+         *
+         * @return host of the current file.
+         */
+        private Host host() {
+            return host;
+        }
+
+        /**
+         * Returns the language of the static file.
+         *
+         * @return language of the current file.
+         */
+        private Language language() {
+            return language;
+        }
+
+        /**
+         * Returns the static bundle root.
+         *
+         * @return bundle root directory.
+         */
+        private File bundleRoot() {
+            return bundleRoot;
+        }
+
+        /**
+         * Returns the file or directory currently being processed.
+         *
+         * @return bundle file or directory.
+         */
+        private File file() {
+            return file;
+        }
+    }
+
+    /**
+     * Publishes all vanity aliases compatible with the current static file
+     * and refreshes the persisted mapping.
+     *
+     * @param request current static file context.
+     * @throws DotPublishingException when alias publishing fails.
+     */
+    private void publishVanityAliases(final VanityRequest request) throws DotPublishingException {
+        if (!isS3VanityAliasEnabled()) {
+            return;
+        }
+
+        for (final File staticFile : getFilesForVanityProcessing(request.file())) {
+            publishVanityAliasesForFile(request, staticFile);
+        }
+    }
+
+    /**
+     * Unpublishes the persisted vanity aliases for the current static file
+     * and removes their mappings when successful.
+     *
+     * @param request current static file context.
+     * @throws DotPublishingException when alias unpublishing fails.
+     */
+    private void unpublishVanityAliases(final VanityRequest request) throws DotPublishingException {
+        if (!isS3VanityAliasEnabled() || request.file().isDirectory()) {
+            return;
+        }
+
+        final String filePath = toStaticPath(request.bundleRoot(), request.file());
+        final S3VanityAliasLookup lookup = toLookup(request, filePath);
+
+        try {
+            final List<S3VanityAliasMap> mappings = this.s3VanityAliasMapRepository.findMappings(lookup);
+            if (mappings.isEmpty()) {
+                return;
+            }
+
+            for (final S3VanityAliasMap mapping : mappings) {
+                request.target().publisher().deleteFilesFromEndpoint(
+                        request.target().bucketName(),
+                        request.target().bucketPrefix(),
+                        mapping.vanityPath());
+            }
+
+            this.s3VanityAliasMapRepository.deleteMappings(lookup);
+        } catch (final Exception e) {
+            throw new DotPublishingException(e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Publishes vanity aliases for a single static file already materialized
+     * in the bundle.
+     *
+     * @param request current static file context.
+     * @param staticFile physical file to duplicate across vanity aliases.
+     * @throws DotPublishingException when alias publishing fails.
+     */
+    private void publishVanityAliasesForFile(final VanityRequest request, final File staticFile)
+            throws DotPublishingException {
+
+        if (!staticFile.isFile()) {
+            return;
+        }
+
+        final String filePath = toStaticPath(request.bundleRoot(), staticFile);
+        final S3VanityAliasLookup lookup = toLookup(request, filePath);
+        final List<S3VanityAliasMap> mappings = resolveAliasMappings(lookup, request.host(), request.language());
+        if (mappings.isEmpty()) {
+            replaceAliasMappings(lookup, List.of());
+            return;
+        }
+
+        final List<S3VanityAliasMap> publishedMappings = new ArrayList<>();
+        DotPublishingException publishException = null;
+
+        for (final S3VanityAliasMap mapping : mappings) {
+            try {
+                request.target().publisher().pushFileToEndpoint(
+                        request.target().bucketName(),
+                        request.target().bucketPrefix(),
+                        mapping.vanityPath(),
+                        staticFile);
+                publishedMappings.add(mapping);
+            } catch (final DotPublishingException e) {
+                if (publishException == null) {
+                    publishException = e;
+                }
+                Logger.error(this.getClass(),
+                        String.format("Unable to publish S3 vanity alias '%s' for canonical path '%s'",
+                                mapping.vanityPath(), mapping.canonicalPath()),
+                        e);
+            }
+        }
+
+        if (publishException != null) {
+            rollbackPublishedVanityAliases(request, publishedMappings);
+            throw publishException;
+        }
+
+        try {
+            replaceAliasMappings(lookup, mappings);
+        } catch (final DotPublishingException e) {
+            rollbackPublishedVanityAliases(request, publishedMappings);
+            throw e;
+        }
+    }
+
+    /**
+     * Resolves the vanity mappings applicable to a canonical static path.
+     *
+     * @param lookup logical key for the canonical static file.
+     * @param host host of the static file.
+     * @param language language of the static file.
+     * @return vanity mappings compatible with static S3 publishing.
+     */
+    private List<S3VanityAliasMap> resolveAliasMappings(
+            final S3VanityAliasLookup lookup,
+            final Host host,
+            final Language language) {
+
+        final List<CachedVanityUrl> vanityUrls = this.vanityUrlAPI.findByForward(
+                host,
+                language,
+                lookup.canonicalPath(),
+                HttpServletResponse.SC_OK,
+                true);
+
+        final List<S3VanityAliasMap> mappings = S3VanityAliasSupport.toAliasMaps(lookup, vanityUrls);
+        logUnsupportedVanityUrls(lookup, vanityUrls);
+        return mappings;
+    }
+
+    /**
+     * Logs Vanity URLs that were found but are not compatible with static S3
+     * publishing.
+     *
+     * @param lookup logical key for the canonical static file.
+     * @param vanityUrls vanity URL candidates.
+     */
+    private void logUnsupportedVanityUrls(
+            final S3VanityAliasLookup lookup,
+            final List<CachedVanityUrl> vanityUrls) {
+
+        vanityUrls.stream()
+                .map(vanityUrl -> vanityUrl.url)
+                .filter(vanityPath -> !S3VanityAliasSupport.isSupportedVanityPath(vanityPath))
+                .forEach(vanityPath -> Logger.warn(this.getClass(),
+                        String.format("Skipping unsupported S3 vanity alias '%s' for canonical path '%s'",
+                                vanityPath, lookup.canonicalPath())));
+    }
+
+    /**
+     * Replaces the persisted mappings for a canonical static path.
+     *
+     * @param lookup logical key for the canonical static file.
+     * @param mappings mappings to save.
+     * @throws DotPublishingException when persistence fails.
+     */
+    private void replaceAliasMappings(
+            final S3VanityAliasLookup lookup,
+            final List<S3VanityAliasMap> mappings) throws DotPublishingException {
+        try {
+            this.s3VanityAliasMapRepository.replaceMappings(lookup, mappings);
+        } catch (final DotDataException e) {
+            throw new DotPublishingException(e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Removes vanity aliases already pushed for a file when the batch cannot
+     * be completed successfully.
+     *
+     * @param request current static file context.
+     * @param publishedMappings aliases already pushed to S3.
+     */
+    private void rollbackPublishedVanityAliases(
+            final VanityRequest request,
+            final List<S3VanityAliasMap> publishedMappings) {
+
+        for (final S3VanityAliasMap mapping : publishedMappings) {
+            try {
+                request.target().publisher().deleteFilesFromEndpoint(
+                        request.target().bucketName(),
+                        request.target().bucketPrefix(),
+                        mapping.vanityPath());
+            } catch (final DotPublishingException e) {
+                Logger.error(this.getClass(),
+                        String.format("Unable to rollback S3 vanity alias '%s' for canonical path '%s'",
+                                mapping.vanityPath(), mapping.canonicalPath()),
+                        e);
+            }
+        }
+    }
+
+    /**
+     * Translates the physical bundle file into the static path actually used
+     * as the S3 logical key.
+     *
+     * @param bundleRoot static bundle root.
+     * @param file physical bundle file.
+     * @return static path relative to host and language.
+     */
+    private String toStaticPath(final File bundleRoot, final File file) {
+        String filePath = file.getAbsolutePath().replace(bundleRoot.getAbsolutePath() + LIVE_FOLDER, "");
+        filePath = filePath.substring(filePath.indexOf(File.separator, filePath.indexOf(File.separator) + 1));
+        return filePath.substring(filePath.indexOf(File.separator, filePath.indexOf(File.separator) + 1));
+    }
+
+    /**
+     * Returns the leaf files used to manage vanity URLs.
+     *
+     * @param file file or directory being processed.
+     * @return leaf files actually published on S3.
+     */
+    private List<File> getFilesForVanityProcessing(final File file) {
+        if (file.isDirectory()) {
+            return new ArrayList<>(FileUtils.listFiles(file, TrueFileFilter.INSTANCE, TrueFileFilter.INSTANCE));
+        }
+
+        return List.of(file);
+    }
+
+    /**
+     * Builds the logical key used to read or write persisted vanity mappings.
+     *
+     * @param request current static file context.
+     * @param filePath canonical static file path.
+     * @return logical key for the mapping table.
+     */
+    private S3VanityAliasLookup toLookup(final VanityRequest request, final String filePath) {
+        return new S3VanityAliasLookup(
+                request.target().endpointId(),
+                request.host().getIdentifier(),
+                request.language().getId(),
+                filePath);
+    }
+
+    /**
+     * Indicates whether the static S3 vanity alias feature is enabled.
+     *
+     * @return {@code true} when the feature is enabled.
+     */
+    private boolean isS3VanityAliasEnabled() {
+        return Config.getBooleanProperty(STATIC_PUSH_S3_VANITY_ALIAS_ENABLED, false);
+    }
 
     @NotNull
     private String updateStatusFailedToSend(PublishAuditHistory currentStatusHistory, Environment environment, PublishingEndPoint endpoint, EndpointDetail detail) throws DotDataException {
