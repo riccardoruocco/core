@@ -127,12 +127,9 @@ public class AWSS3EndPointPublisher implements EndPointPublisher {
         try{
             //We want to ignore these extensions because they weren't pushed.
             if (awss3FileFilter.accept(new File(filePath))) {
-                String filePathInBucket = filePath;
-                if (filePathInBucket.startsWith(File.separator)){
-                    filePathInBucket = filePathInBucket.substring(1);
-                }
-                if (UtilMethods.isSet(bucketRootPrefix)){
-                    filePathInBucket = bucketRootPrefix + File.separator + filePathInBucket;
+                final String filePathInBucket = this.getCompleteFileKey(bucketRootPrefix, filePath);
+                if (!UtilMethods.isSet(filePathInBucket)) {
+                    return;
                 }
                 Logger.debug(this, "Deleting file named: " + filePathInBucket + " from bucket: " + bucketName);
                 this.storage.deleteFile(bucketName, filePathInBucket);

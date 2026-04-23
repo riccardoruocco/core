@@ -32,6 +32,7 @@ import com.dotmarketing.portlets.contentlet.business.HostAPI;
 import com.dotmarketing.portlets.languagesmanager.model.Language;
 import com.dotmarketing.util.*;
 import com.google.common.annotations.VisibleForTesting;
+import io.vavr.Lazy;
 import org.apache.logging.log4j.ThreadContext;
 import org.jetbrains.annotations.NotNull;
 
@@ -63,6 +64,8 @@ public class AWSS3Publisher extends Publisher {
     public static final String STATIC_PUSH_S3_VANITY_ALIAS_ENABLED       = "STATIC_PUSH_S3_VANITY_ALIAS_ENABLED";
 
     private static final String CREATED_BUCKETS                          = "createdBuckets";
+    private static final Lazy<Boolean> S3_VANITY_ALIAS_ENABLED =
+            Lazy.of(() -> Config.getBooleanProperty(STATIC_PUSH_S3_VANITY_ALIAS_ENABLED, false));
 
     private final HostAPI hostAPI;
     private final PublishAuditAPI publishAuditAPI;
@@ -684,12 +687,11 @@ public class AWSS3Publisher extends Publisher {
         final String filePath = toStaticPath(request.bundleRoot(), staticFile);
         final S3VanityAliasLookup lookup = toLookup(request, filePath);
         final List<S3VanityAliasMap> mappings = resolveAliasMappings(lookup, request.host(), request.language());
-        if (mappings.isEmpty()) {
-            replaceAliasMappings(lookup, List.of());
-            return;
-        }
+        final List<S3VanityAliasMap> currentMappings = findCurrentMappings(lookup);
+        final List<S3VanityAliasMap> obsoleteMappings = findObsoleteMappings(currentMappings, mappings);
 
         final List<S3VanityAliasMap> publishedMappings = new ArrayList<>();
+        final List<S3VanityAliasMap> deletedObsoleteMappings = new ArrayList<>();
         DotPublishingException publishException = null;
 
         for (final S3VanityAliasMap mapping : mappings) {
@@ -717,9 +719,11 @@ public class AWSS3Publisher extends Publisher {
         }
 
         try {
+            deleteObsoleteVanityAliases(request, obsoleteMappings, deletedObsoleteMappings);
             replaceAliasMappings(lookup, mappings);
         } catch (final DotPublishingException e) {
             rollbackPublishedVanityAliases(request, publishedMappings);
+            restoreDeletedVanityAliases(request, deletedObsoleteMappings, staticFile);
             throw e;
         }
     }
@@ -761,6 +765,7 @@ public class AWSS3Publisher extends Publisher {
             final List<CachedVanityUrl> vanityUrls) {
 
         vanityUrls.stream()
+                .filter(Objects::nonNull)
                 .map(vanityUrl -> vanityUrl.url)
                 .filter(vanityPath -> !S3VanityAliasSupport.isSupportedVanityPath(vanityPath))
                 .forEach(vanityPath -> Logger.warn(this.getClass(),
@@ -782,6 +787,95 @@ public class AWSS3Publisher extends Publisher {
             this.s3VanityAliasMapRepository.replaceMappings(lookup, mappings);
         } catch (final DotDataException e) {
             throw new DotPublishingException(e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Returns the current persisted mappings for a canonical static path.
+     *
+     * @param lookup logical key for the canonical static file.
+     * @return mappings currently stored for the lookup.
+     * @throws DotPublishingException when the lookup fails.
+     */
+    private List<S3VanityAliasMap> findCurrentMappings(final S3VanityAliasLookup lookup)
+            throws DotPublishingException {
+        try {
+            return this.s3VanityAliasMapRepository.findMappings(lookup);
+        } catch (final DotDataException e) {
+            throw new DotPublishingException(e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Resolves previously persisted aliases that are no longer part of the
+     * desired alias set.
+     *
+     * @param currentMappings mappings currently persisted.
+     * @param desiredMappings mappings resolved for the current publish operation.
+     * @return stale mappings that must be removed from S3.
+     */
+    private List<S3VanityAliasMap> findObsoleteMappings(
+            final List<S3VanityAliasMap> currentMappings,
+            final List<S3VanityAliasMap> desiredMappings) {
+
+        final Set<String> desiredPaths = desiredMappings.stream()
+                .map(S3VanityAliasMap::vanityPath)
+                .collect(Collectors.toSet());
+
+        return currentMappings.stream()
+                .filter(mapping -> !desiredPaths.contains(mapping.vanityPath()))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Deletes stale aliases and records the ones already removed so they can be
+     * restored if the batch fails before the mapping update completes.
+     *
+     * @param request current static file context.
+     * @param obsoleteMappings aliases that should no longer exist.
+     * @param deletedObsoleteMappings collector for aliases deleted successfully.
+     * @throws DotPublishingException when deletion fails.
+     */
+    private void deleteObsoleteVanityAliases(
+            final VanityRequest request,
+            final List<S3VanityAliasMap> obsoleteMappings,
+            final List<S3VanityAliasMap> deletedObsoleteMappings) throws DotPublishingException {
+
+        for (final S3VanityAliasMap mapping : obsoleteMappings) {
+            request.target().publisher().deleteFilesFromEndpoint(
+                    request.target().bucketName(),
+                    request.target().bucketPrefix(),
+                    mapping.vanityPath());
+            deletedObsoleteMappings.add(mapping);
+        }
+    }
+
+    /**
+     * Restores previously deleted obsolete aliases when the publish flow fails
+     * before the new mapping state can be persisted.
+     *
+     * @param request current static file context.
+     * @param deletedObsoleteMappings aliases deleted before the failure.
+     * @param staticFile physical file used to recreate the aliases.
+     */
+    private void restoreDeletedVanityAliases(
+            final VanityRequest request,
+            final List<S3VanityAliasMap> deletedObsoleteMappings,
+            final File staticFile) {
+
+        for (final S3VanityAliasMap mapping : deletedObsoleteMappings) {
+            try {
+                request.target().publisher().pushFileToEndpoint(
+                        request.target().bucketName(),
+                        request.target().bucketPrefix(),
+                        mapping.vanityPath(),
+                        staticFile);
+            } catch (final DotPublishingException e) {
+                Logger.error(this.getClass(),
+                        String.format("Unable to restore obsolete S3 vanity alias '%s' for canonical path '%s'",
+                                mapping.vanityPath(), mapping.canonicalPath()),
+                        e);
+            }
         }
     }
 
@@ -860,7 +954,7 @@ public class AWSS3Publisher extends Publisher {
      * @return {@code true} when the feature is enabled.
      */
     private boolean isS3VanityAliasEnabled() {
-        return Config.getBooleanProperty(STATIC_PUSH_S3_VANITY_ALIAS_ENABLED, false);
+        return S3_VANITY_ALIAS_ENABLED.get();
     }
 
     @NotNull
